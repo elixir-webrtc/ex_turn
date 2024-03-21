@@ -1,6 +1,9 @@
 defmodule ExTURN.MixProject do
   use Mix.Project
 
+  @version "0.1.0"
+  @source_url "https://github.com/elixir-webrtc/ex_turn"
+
   def project do
     [
       app: :ex_turn,
@@ -8,6 +11,10 @@ defmodule ExTURN.MixProject do
       elixir: "~> 1.16",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
+
+      # docs
+      docs: docs(),
+      source_url: @source_url,
 
       # code coverage
       test_coverage: [tool: ExCoveralls],
@@ -29,10 +36,22 @@ defmodule ExTURN.MixProject do
 
   defp deps do
     [
+      {:ex_stun, github: "elixir-webrtc/ex_stun", branch: "uri"},
+
+      # dev/test
       {:excoveralls, "~> 0.17.0", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.31.0", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.4", only: [:dev, :test], runtime: false}
+    ]
+  end
+
+  defp docs() do
+    [
+      main: "readme",
+      extras: ["README.md"],
+      source_ref: "v#{@version}",
+      formatters: ["html"]
     ]
   end
 end
