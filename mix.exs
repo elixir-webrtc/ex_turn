@@ -29,6 +29,9 @@ defmodule ExTURN.MixProject do
 
   defp deps do
     [
+      {:ex_stun, github: "elixir-webrtc/ex_stun", branch: "uri"},
+
+      # dev/test
       {:excoveralls, "~> 0.17.0", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.31.0", only: :dev, runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
