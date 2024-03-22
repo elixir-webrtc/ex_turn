@@ -16,6 +16,12 @@ defmodule ExTURN.MixProject do
       docs: docs(),
       source_url: @source_url,
 
+      # dialyzer
+      dialyzer: [
+        plt_local_path: "_dialyzer",
+        plt_core_path: "_dialyzer"
+      ],
+
       # code coverage
       test_coverage: [tool: ExCoveralls],
       preferred_cli_env: [
@@ -36,7 +42,7 @@ defmodule ExTURN.MixProject do
 
   defp deps do
     [
-      {:ex_stun, github: "elixir-webrtc/ex_stun", branch: "uri"},
+      {:ex_stun, github: "elixir-webrtc/ex_stun"},
 
       # dev/test
       {:excoveralls, "~> 0.17.0", only: [:dev, :test], runtime: false},

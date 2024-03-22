@@ -87,6 +87,7 @@ defmodule ExTURN.Client do
           nonce: binary(),
           key: binary(),
           transactions: %{(transaction_id :: integer()) => ExSTUN.Message.t()},
+          permissions: MapSet.t(:inet.ip_address()),
           addr_channel: %{addr() => pos_integer()},
           channel_addr: %{pos_integer() => addr()}
         }
