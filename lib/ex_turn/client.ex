@@ -24,7 +24,7 @@ defmodule ExTURN.Client do
 
   Every notification has to be passed back to the client with `handle_message/2`.
   """
-  @type notification() :: {:turn_client, client_ref :: reference(), notification_message()}
+  @type notification() :: {:ex_turn, client_ref :: reference(), notification_message()}
 
   @typedoc """
   Notification message.
@@ -580,5 +580,5 @@ defmodule ExTURN.Client do
   end
 
   defp notify_after(client, msg, time),
-    do: Process.send_after(self(), {:turn_client, client.ref, msg}, time)
+    do: Process.send_after(self(), {:ex_turn, client.ref, msg}, time)
 end
