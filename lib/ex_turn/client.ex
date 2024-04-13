@@ -156,24 +156,43 @@ defmodule ExTURN.Client do
   end
 
   @spec create_channel(t(), :inet.ip_address(), :inet.port_number()) ::
-          {:send, addr(), binary(), t()}
+          {:ok, t()} | {:send, addr(), binary(), t()}
   def create_channel(%__MODULE__{state: :allocated} = client, ip, port) do
     # TODO: Wait 5 minutes before re-using channel number or transport address.
     # See RFC 5766 sec. 11.
-    channel_number = find_free_channel_number(Map.values(client.addr_channel))
 
-    req =
-      channel_bind_request(
-        channel_number,
-        ip,
-        port,
-        client.username,
-        client.realm,
-        client.nonce,
-        client.key
-      )
+    tr =
+      Enum.find(client.transactions, fn {_id, msg} ->
+        if msg.type.class == :request and msg.type.method == :channel_bind do
+          {:ok, xor_addr} = Message.get_attribute(msg, XORPeerAddress)
+          xor_addr.address == ip and xor_addr.port == port
+        else
+          false
+        end
+      end)
 
-    execute_transaction(client, req)
+    if tr do
+      Logger.debug("""
+      There is already channel transaction for: #{inspect(ip)}:#{port} in-progress. Ignoring request.
+      """)
+
+      {:ok, client}
+    else
+      channel_number = find_free_channel_number(Map.values(client.addr_channel))
+
+      req =
+        channel_bind_request(
+          channel_number,
+          ip,
+          port,
+          client.username,
+          client.realm,
+          client.nonce,
+          client.key
+        )
+
+      execute_transaction(client, req)
+    end
   end
 
   @spec send(t(), addr(), binary()) :: {:ok, t()} | {:send, addr(), binary(), t()}
