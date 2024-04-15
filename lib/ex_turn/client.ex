@@ -236,6 +236,12 @@ defmodule ExTURN.Client do
     do_handle_message(client, msg)
   end
 
+  @spec has_permission?(t(), :inet.ip_address()) :: boolean()
+  def has_permission?(client, ip), do: MapSet.member?(client.permissions, ip)
+
+  @spec has_channel?(t(), :inet.ip_address(), :inet.port_number()) :: boolean()
+  def has_channel?(client, ip, port), do: Map.has_key?(client.addr_channel, {ip, port})
+
   # PRIVATE FUNCTIONS
 
   defp do_handle_message(
@@ -243,7 +249,7 @@ defmodule ExTURN.Client do
          {:socket_data, src_ip, src_port, packet}
        ) do
     cond do
-      channel_data?(packet) == true ->
+      ExTURN.channel_data?(packet) == true ->
         handle_channel_data(client, packet)
 
       ExSTUN.stun?(packet) == true ->
@@ -588,10 +594,6 @@ defmodule ExTURN.Client do
     |> Message.with_integrity(key)
     |> Message.with_fingerprint()
   end
-
-  # Based on RFC 5766, sec. 11.
-  defp channel_data?(<<1::2, _rest::bitstring>>), do: true
-  defp channel_data?(_), do: false
 
   defp find_free_channel_number(channels) do
     channels = MapSet.new(channels)
