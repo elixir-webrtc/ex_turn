@@ -5,7 +5,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/elixir-webrtc/ex_turn/ci.yml?logo=github&label=CI)](https://github.com/elixir-webrtc/ex_turn/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/elixir-webrtc/ex_turn/graph/badge.svg?token=E98NHC8B00)](https://codecov.io/gh/elixir-webrtc/ex_turn)
 
-Implementation of the TURN client.
+In-memory implementation of the TURN client.
 
 Implements:
 * [RFC 5766](https://datatracker.ietf.org/doc/html/rfc5766)

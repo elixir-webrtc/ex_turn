@@ -10,6 +10,8 @@ defmodule ExTURN.MixProject do
       version: "0.1.0",
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
+      description: "In-memory implementation of the TURN client",
+      package: package(),
       deps: deps(),
 
       # docs
@@ -40,9 +42,16 @@ defmodule ExTURN.MixProject do
     ]
   end
 
+  def package do
+    [
+      licenses: ["Apache-2.0"],
+      links: %{"GitHub" => @source_url}
+    ]
+  end
+
   defp deps do
     [
-      {:ex_stun, github: "elixir-webrtc/ex_stun"},
+      {:ex_stun, "~> 0.2.0"},
 
       # dev/test
       {:excoveralls, "~> 0.17.0", only: [:dev, :test], runtime: false},
