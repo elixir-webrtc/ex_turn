@@ -33,7 +33,7 @@ defmodule ExTURN.Client do
   """
   @opaque notification_message() ::
             :refresh_alloc
-            | {:refresh_permission, XORRelayedAddress.t()}
+            | {:refresh_permission, :inet.ip_address()}
             | {:transaction_timeout, transaction_id :: integer()}
 
   @typedoc """
@@ -459,7 +459,7 @@ defmodule ExTURN.Client do
 
         notify_after(
           client,
-          {:refresh_permission, xor_peer_addr},
+          {:refresh_permission, xor_peer_addr.address},
           div(@permission_lifetime_ms, 2)
         )
 
@@ -595,9 +595,11 @@ defmodule ExTURN.Client do
     |> Message.with_fingerprint()
   end
 
-  defp find_free_channel_number(channels) do
-    channels = MapSet.new(channels)
-    Enum.find(0x4000..0x7FFF, &(not MapSet.member?(channels, &1)))
+  defp find_free_channel_number(_channels) do
+    # TODO
+    # channels = MapSet.new(channels)
+    # Enum.find(0x4000..0x7FFF, &(not MapSet.member?(channels, &1)))
+    Enum.random(0x4000..0x7FFF)
   end
 
   defp notify_after(client, msg, time),
