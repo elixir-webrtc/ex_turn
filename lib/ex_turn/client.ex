@@ -595,11 +595,9 @@ defmodule ExTURN.Client do
     |> Message.with_fingerprint()
   end
 
-  defp find_free_channel_number(_channels) do
-    # TODO
-    # channels = MapSet.new(channels)
-    # Enum.find(0x4000..0x7FFF, &(not MapSet.member?(channels, &1)))
-    Enum.random(0x4000..0x7FFF)
+  defp find_free_channel_number(channels) do
+    channels = MapSet.new(channels)
+    Enum.find(0x4000..0x7FFF, &(not MapSet.member?(channels, &1)))
   end
 
   defp notify_after(client, msg, time),
