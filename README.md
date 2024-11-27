@@ -15,7 +15,7 @@ Implements:
 ```elixir
 def deps do
   [
-    {:ex_turn, "~> 0.1.0"}
+    {:ex_turn, "~> 0.1.1"}
   ]
 end
 ```

@@ -1,13 +1,13 @@
 defmodule ExTURN.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.1.1"
   @source_url "https://github.com/elixir-webrtc/ex_turn"
 
   def project do
     [
       app: :ex_turn,
-      version: "0.1.0",
+      version: @version,
       elixir: "~> 1.15",
       start_permanent: Mix.env() == :prod,
       description: "In-memory implementation of the TURN client",
