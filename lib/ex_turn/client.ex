@@ -33,7 +33,7 @@ defmodule ExTURN.Client do
   """
   @opaque notification_message() ::
             :refresh_alloc
-            | {:refresh_permission, XORRelayedAddress.t()}
+            | {:refresh_permission, :inet.ip_address()}
             | {:transaction_timeout, transaction_id :: integer()}
 
   @typedoc """
@@ -459,7 +459,7 @@ defmodule ExTURN.Client do
 
         notify_after(
           client,
-          {:refresh_permission, xor_peer_addr},
+          {:refresh_permission, xor_peer_addr.address},
           div(@permission_lifetime_ms, 2)
         )
 
