@@ -12,6 +12,8 @@ defmodule ExTURN.ClientTest do
   @username "testusername"
   @password "testpassword"
   @nonce "testnonce"
+  # used for testing stale nonce response
+  @new_nonce "newtestnonce"
   @realm "testrealm"
   @data "RFC 5766"
 
@@ -28,29 +30,178 @@ defmodule ExTURN.ClientTest do
     assert {:ok, %Client{}} = Client.new(@turn_uri, @username, @password)
   end
 
-  test "allocate/1" do
-    {:ok, client} = Client.new(@turn_uri, @username, @password)
-    allocate(client)
+  describe "allocation" do
+    test "create" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      allocate(client)
+    end
+
+    test "refresh success response" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+
+      alloc_exp_timer = client.alloc_exp_timer
+
+      {:send, _dst, data, client} = Client.handle_message(client, :refresh_alloc)
+      {:ok, req} = Message.decode(data)
+      resp = refresh_success_response(req)
+
+      resp = {:socket_data, client.turn_ip, client.turn_port, resp}
+      assert {:ok, new_client} = Client.handle_message(client, resp)
+      # assert that the timer has changed
+      assert new_client.alloc_exp_timer != nil
+      assert new_client.alloc_exp_timer != alloc_exp_timer
+    end
+
+    test "refresh error response" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+
+      alloc_exp_timer = client.alloc_exp_timer
+
+      {:send, _dst, data, client} = Client.handle_message(client, :refresh_alloc)
+      {:ok, req} = Message.decode(data)
+      resp = insufficient_capacity_error_response(req)
+
+      resp = {:socket_data, client.turn_ip, client.turn_port, resp}
+      assert {:ok, new_client} = Client.handle_message(client, resp)
+      # assert that the timer hasn't changed 
+      assert new_client.alloc_exp_timer == alloc_exp_timer
+    end
   end
 
-  test "create_permission/2" do
+  test "stale nonce" do
     {:ok, client} = Client.new(@turn_uri, @username, @password)
     client = allocate(client)
-    create_permission(client, @peer_ip)
+
+    {:send, _dst, data, client} = Client.handle_message(client, :refresh_alloc)
+
+    {:ok, req} = Message.decode(data)
+    resp = stale_nonce_response(req)
+
+    resp = {:socket_data, client.turn_ip, client.turn_port, resp}
+    assert {:send, _dst, data, _client} = Client.handle_message(client, resp)
+    {:ok, new_req} = Message.decode(data)
+
+    assert new_req.transaction_id != req.transaction_id
+    assert new_req.type == req.type
+    assert {:ok, %Nonce{value: @new_nonce}} = Message.get_attribute(new_req, Nonce)
   end
 
-  describe "create_channel/3" do
-    test "with permission created beforehand" do
+  describe "permission" do
+    test "create" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+      create_permission(client, @peer_ip)
+    end
+
+    test "refresh success response" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+      client = create_permission(client, @peer_ip)
+
+      [%{exp_timer: exp_timer, refresh_timer: refresh_timer}] = Map.values(client.permissions)
+
+      # refresh permission
+      {:send, _dst, data, client} = Client.handle_message(client, {:refresh_permission, @peer_ip})
+      {:ok, req} = Message.decode(data)
+      resp = create_permission_success_response(req)
+      resp = {:socket_data, client.turn_ip, client.turn_port, resp}
+      {:ok, client} = Client.handle_message(client, resp)
+
+      # assert there is a new timer 
+      [%{exp_timer: new_exp_timer, refresh_timer: new_refresh_timer}] =
+        Map.values(client.permissions)
+
+      assert exp_timer != new_exp_timer
+      assert refresh_timer != new_refresh_timer
+      assert Process.read_timer(exp_timer) == false
+      assert Process.read_timer(refresh_timer) == false
+    end
+
+    test "refresh error response" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+      client = create_permission(client, @peer_ip)
+
+      [%{exp_timer: exp_timer, refresh_timer: refresh_timer}] = Map.values(client.permissions)
+
+      # refresh permission
+      {:send, _dst, data, client} = Client.handle_message(client, {:refresh_permission, @peer_ip})
+      {:ok, req} = Message.decode(data)
+      resp = insufficient_capacity_error_response(req)
+      resp = {:socket_data, client.turn_ip, client.turn_port, resp}
+      {:ok, _client} = Client.handle_message(client, resp)
+
+      # assert there is no new timer
+      [%{exp_timer: new_exp_timer, refresh_timer: new_refresh_timer}] =
+        Map.values(client.permissions)
+
+      assert new_exp_timer == exp_timer
+      assert new_refresh_timer == refresh_timer
+      assert Process.read_timer(new_exp_timer) != false
+    end
+  end
+
+  describe "channel" do
+    test "create with permission created beforehand" do
       {:ok, client} = Client.new(@turn_uri, @username, @password)
       client = allocate(client)
       client = create_permission(client, @peer_ip)
       create_channel(client, @peer_ip, @peer_port)
     end
 
-    test "without permission" do
+    test "create without permission" do
       {:ok, client} = Client.new(@turn_uri, @username, @password)
       client = allocate(client)
       create_channel(client, @peer_ip, @peer_port)
+    end
+
+    test "refresh success response" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+      client = create_channel(client, @peer_ip, @peer_port)
+
+      exp_timer = Map.values(client.channel_timer) |> List.first()
+
+      {:send, _dst, data, client} =
+        Client.handle_message(client, {:refresh_channel, {@peer_ip, @peer_port}})
+
+      {:ok, req} = Message.decode(data)
+
+      resp = create_channel_bind_success_response(req)
+      resp = {:socket_data, client.turn_ip, client.turn_port, resp}
+      assert {:ok, client} = Client.handle_message(client, resp)
+
+      new_exp_timer = Map.values(client.channel_timer) |> List.first()
+
+      assert new_exp_timer != nil
+      assert exp_timer != new_exp_timer
+      assert Process.read_timer(exp_timer) == false
+      assert Process.read_timer(new_exp_timer) != false
+    end
+
+    test "refresh error response" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+      client = create_channel(client, @peer_ip, @peer_port)
+
+      exp_timer = Map.values(client.channel_timer) |> List.first()
+
+      {:send, _dst, data, client} =
+        Client.handle_message(client, {:refresh_channel, {@peer_ip, @peer_port}})
+
+      {:ok, req} = Message.decode(data)
+
+      resp = insufficient_capacity_error_response(req)
+      resp = {:socket_data, client.turn_ip, client.turn_port, resp}
+      assert {:ok, client} = Client.handle_message(client, resp)
+
+      new_exp_timer = Map.values(client.channel_timer) |> List.first()
+
+      assert exp_timer == new_exp_timer
+      assert Process.read_timer(exp_timer) != false
+      assert client.state != :error
     end
   end
 
@@ -168,6 +319,7 @@ defmodule ExTURN.ClientTest do
     resp = allocate_success_response(req)
     resp = {:socket_data, client.turn_ip, client.turn_port, resp}
     assert {:allocation_created, _, client} = Client.handle_message(client, resp)
+    assert client.alloc_exp_timer != nil
 
     client
   end
@@ -215,6 +367,24 @@ defmodule ExTURN.ClientTest do
     |> Message.encode()
   end
 
+  defp refresh_success_response(req) do
+    key = auth_request(req)
+
+    Message.new(req.transaction_id, %Type{class: :success_response, method: :refresh}, [
+      %Lifetime{value: 600}
+    ])
+    |> Message.with_integrity(key)
+    |> Message.encode()
+  end
+
+  defp stale_nonce_response(req) do
+    Message.new(req.transaction_id, %Type{class: :error_response, method: req.type.method}, [
+      %Nonce{value: @new_nonce},
+      %ErrorCode{code: 438}
+    ])
+    |> Message.encode()
+  end
+
   defp create_permission_success_response(req) do
     key = auth_request(req)
 
@@ -234,6 +404,18 @@ defmodule ExTURN.ClientTest do
       req.transaction_id,
       %Type{class: :success_response, method: :channel_bind},
       []
+    )
+    |> Message.with_integrity(key)
+    |> Message.encode()
+  end
+
+  defp insufficient_capacity_error_response(req) do
+    key = auth_request(req)
+
+    Message.new(
+      req.transaction_id,
+      %Type{class: :error_response, method: req.type.method},
+      [%ErrorCode{code: 508}]
     )
     |> Message.with_integrity(key)
     |> Message.encode()

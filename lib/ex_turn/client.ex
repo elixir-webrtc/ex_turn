@@ -21,19 +21,25 @@ defmodule ExTURN.Client do
 
   @typedoc """
   Notifications emitted by the client.
-
-  Every notification has to be passed back to the client with `handle_message/2`.
   """
-  @type notification() :: {:ex_turn, client_ref :: reference(), notification_message()}
+  @type notification() ::
+          {:ex_turn, client_ref :: reference(),
+           msg :: public_notification_message() | internal_notification_message()}
+
+  @type public_notification_message() ::
+          {:allocation_expired, addr()}
+          | {:permission_expired, :inet.ip_address()}
+          | {:channel_expired, addr()}
 
   @typedoc """
-  Notification message.
+  Internal notification message.
 
-  Handled by the client. User code must not rely on its structure.
+  Has to be passed back to the client with `handle_message/2`.
   """
-  @opaque notification_message() ::
+  @opaque internal_notification_message() ::
             :refresh_alloc
             | {:refresh_permission, :inet.ip_address()}
+            | {:refresh_channel, addr()}
             | {:transaction_timeout, transaction_id :: integer()}
 
   @typedoc """
@@ -41,7 +47,7 @@ defmodule ExTURN.Client do
   """
   @type message() ::
           {:socket_data, :inet.ip_address(), :inet.port_number(), binary()}
-          | notification_message()
+          | internal_notification_message()
 
   @typedoc """
   Return values of `handle_message/2`.
@@ -51,8 +57,11 @@ defmodule ExTURN.Client do
   * `:allocation_created` - an allocation has been successfully created.
   * `:permission_created` - a permission has been successfully created and
   the client is ready to send data with `send/3`.
+  * `:permission_expired` - a permission could not be refreshed and eventually expired.
+  Together with expired permission, all channels bound to the permission ip also expire.
   * `:channel_created` - a channel has been successfully created and all
   subsequent calls to `send/3` will use channel data message format.
+  * `:channel_expired` - a channel could not be refreshed and eventually expired.
   * `:data` - data has been received from a peer.
   * `:error` - an error has occured and the client cannot be used anymore.
   """
@@ -61,7 +70,9 @@ defmodule ExTURN.Client do
           | {:send, addr(), binary(), t()}
           | {:allocation_created, addr(), t()}
           | {:permission_created, :inet.ip_address(), t()}
+          | {:permission_expired, :inet.ip_address(), t()}
           | {:channel_created, addr(), t()}
+          | {:channel_expired, addr(), t()}
           | {:data, src :: addr(), binary(), t()}
           | {:error, reason :: atom(), t()}
 
@@ -87,9 +98,13 @@ defmodule ExTURN.Client do
           nonce: binary(),
           key: binary(),
           transactions: %{(transaction_id :: integer()) => ExSTUN.Message.t()},
-          permissions: MapSet.t(:inet.ip_address()),
+          permissions: %{
+            :inet.ip_address() => %{:refresh_timer => reference(), :exp_timer => reference()}
+          },
           addr_channel: %{addr() => pos_integer()},
-          channel_addr: %{pos_integer() => addr()}
+          channel_addr: %{pos_integer() => addr()},
+          channel_timer: %{pos_integer() => reference()},
+          alloc_exp_timer: reference()
         }
 
   @enforce_keys [:ref, :uri, :turn_ip, :turn_port, :username, :password]
@@ -98,11 +113,13 @@ defmodule ExTURN.Client do
                 :realm,
                 :nonce,
                 :key,
+                :alloc_exp_timer,
                 state: :new,
                 transactions: %{},
-                permissions: MapSet.new(),
+                permissions: %{},
                 addr_channel: %{},
-                channel_addr: %{}
+                channel_addr: %{},
+                channel_timer: %{}
               ]
 
   # Permission lifetime must be 300 seconds. See RFC 5766 sec. 8.
@@ -112,6 +129,19 @@ defmodule ExTURN.Client do
   @channel_lifetime_ms 10 * 60 * 1000
 
   @transaction_timeout 1000
+
+  # This macro is used to flush mailbox after an allocation, permission or channel has been refreshed.
+  # In fact, this should never happen as we send refresh requests a few minutes before
+  # an allocation, permission or channel expires.
+  defmacrop flush_mailbox(pattern) do
+    quote do
+      receive do
+        unquote(pattern) -> :ok
+      after
+        0 -> :ok
+      end
+    end
+  end
 
   @spec new(ExSTUN.URI.t(), binary(), binary()) ::
           {:ok, t()} | {:error, :unsupported_turn_uri | :invalid_turn_server}
@@ -197,7 +227,7 @@ defmodule ExTURN.Client do
 
   @spec send(t(), addr(), binary()) :: {:ok, t()} | {:send, addr(), binary(), t()}
   def send(%__MODULE__{state: :allocated} = client, {ip, port} = dst, data) do
-    permission = MapSet.member?(client.permissions, ip)
+    permission = Map.has_key?(client.permissions, ip)
     channel = Map.get(client.addr_channel, dst)
 
     case {permission, channel} do
@@ -237,7 +267,7 @@ defmodule ExTURN.Client do
   end
 
   @spec has_permission?(t(), :inet.ip_address()) :: boolean()
-  def has_permission?(client, ip), do: MapSet.member?(client.permissions, ip)
+  def has_permission?(client, ip), do: Map.has_key?(client.permissions, ip)
 
   @spec has_channel?(t(), :inet.ip_address(), :inet.port_number()) :: boolean()
   def has_channel?(client, ip, port), do: Map.has_key?(client.addr_channel, {ip, port})
@@ -271,6 +301,23 @@ defmodule ExTURN.Client do
     execute_transaction(client, req)
   end
 
+  defp do_handle_message(client, {:refresh_channel, {ip, port} = peer_addr}) do
+    channel_number = Map.fetch!(client.addr_channel, peer_addr)
+
+    req =
+      channel_bind_request(
+        channel_number,
+        ip,
+        port,
+        client.username,
+        client.realm,
+        client.nonce,
+        client.key
+      )
+
+    execute_transaction(client, req)
+  end
+
   defp do_handle_message(client, {:transaction_timeout, t_id}) do
     case pop_in(client.transactions[t_id]) do
       {nil, client} ->
@@ -281,6 +328,50 @@ defmodule ExTURN.Client do
         client = %__MODULE__{client | state: :error}
         {:error, reason, client}
     end
+  end
+
+  defp do_handle_message(client, :allocation_expired) do
+    client = %__MODULE__{client | state: :error}
+    {:error, :allocation_expired, client}
+  end
+
+  defp do_handle_message(client, {:permission_expired, ip}) do
+    permissions = Map.delete(client.permissions, ip)
+
+    {to_delete, _} =
+      Map.split_with(client.addr_channel, fn {{ch_ip, _ch_port}, _ch_number} -> ch_ip == ip end)
+
+    addrs_to_delete = Map.keys(to_delete)
+    ch_to_delete = Map.values(to_delete)
+
+    addr_channel = Map.drop(client.addr_channel, addrs_to_delete)
+    channel_addr = Map.drop(client.channel_addr, ch_to_delete)
+    channel_timer = Map.drop(client.channel_timer, ch_to_delete)
+
+    client = %__MODULE__{
+      client
+      | permissions: permissions,
+        addr_channel: addr_channel,
+        channel_addr: channel_addr,
+        channel_timer: channel_timer
+    }
+
+    {:permission_expired, ip, client}
+  end
+
+  defp do_handle_message(client, {:channel_expired, peer_addr}) do
+    {channel_number, addr_channel} = Map.pop!(client.addr_channel, peer_addr)
+    {_, channel_addr} = Map.pop!(client.channel_addr, channel_number)
+    {_, channel_timer} = Map.pop!(client.channel_timer, channel_number)
+
+    client = %__MODULE__{
+      client
+      | addr_channel: addr_channel,
+        channel_addr: channel_addr,
+        channel_timer: channel_timer
+    }
+
+    {:channel_expired, peer_addr, client}
   end
 
   defp handle_channel_data(client, <<channel_number::16, len::16, data::binary-size(len)>>) do
@@ -308,22 +399,28 @@ defmodule ExTURN.Client do
       {:ok, resp} when is_map_key(client.transactions, resp.transaction_id) ->
         {req, client} = pop_in(client.transactions[resp.transaction_id])
 
-        if req.type.method == resp.type.method do
-          do_handle_stun_message(client, req, resp)
-        else
-          Logger.debug("""
-          Received STUN response with non-matching method. Ignoring.
-          STUN request: #{inspect(req)}.
-          STUN response: #{inspect(resp)}.
-          """)
+        cond do
+          resp.type.class == :error_response and
+              match?({:ok, %ErrorCode{code: 438}}, Message.get_attribute(resp, ErrorCode)) ->
+            handle_stale_nonce(client, req, resp)
 
-          {:ok, client}
+          req.type.method == resp.type.method ->
+            do_handle_stun_message(client, req, resp)
+
+          true ->
+            Logger.debug("""
+            Received STUN response with non-matching method. Ignoring.
+            STUN request: #{inspect(req)}.
+            STUN response: #{inspect(resp)}.
+            """)
+
+            {:ok, client}
         end
 
       {:ok, resp} when resp.type == %Type{class: :indication, method: :data} ->
         with {:ok, xor_peer_addr} <- Message.get_attribute(resp, XORPeerAddress),
              {:ok, data} <- Message.get_attribute(resp, Data),
-             {_, true} <- {:perm_check, MapSet.member?(client.permissions, xor_peer_addr.address)} do
+             {_, true} <- {:perm_check, Map.has_key?(client.permissions, xor_peer_addr.address)} do
           from = {xor_peer_addr.address, xor_peer_addr.port}
           {:data, from, data.value, client}
         else
@@ -356,6 +453,26 @@ defmodule ExTURN.Client do
 
       {:error, reason} ->
         Logger.debug("Couldn't decode STUN message, reason: #{reason}. Ignoring.")
+        {:ok, client}
+    end
+  end
+
+  defp handle_stale_nonce(client, req, resp) do
+    case Message.get_attribute(resp, Nonce) do
+      {:ok, %Nonce{value: nonce}} ->
+        # TODO extend ex_stun API so this code isn't so hacky
+        tmp_msg = Message.new(%Type{method: :binding, class: :request})
+        client = %__MODULE__{client | nonce: nonce}
+        attrs = Enum.reject(req.attributes, fn attr -> attr.type == 0x0015 end)
+        req = %Message{req | transaction_id: tmp_msg.transaction_id, attributes: attrs}
+        req = Message.add_attribute(req, Nonce.to_raw(%Nonce{value: nonce}, req))
+        execute_transaction(client, req)
+
+      nil ->
+        Logger.debug(
+          "Received stale nonce response without nonce attribute. Ignoring. Req: #{inspect(req)}, resp: #{inspect(resp)}"
+        )
+
         {:ok, client}
     end
   end
@@ -401,7 +518,8 @@ defmodule ExTURN.Client do
          {:ok, lifetime} <- Message.get_attribute(resp, Lifetime),
          {:ok, _xor_mapped_addr} <- Message.get_attribute(resp, XORMappedAddress) do
       notify_after(client, :refresh_alloc, div(lifetime.value * 1000, 2))
-      client = %__MODULE__{client | state: :allocated}
+      exp_timer = notify_after(client, :allocation_expired, lifetime.value * 1000)
+      client = %__MODULE__{client | state: :allocated, alloc_exp_timer: exp_timer}
       {:allocation_created, {xor_relayed_addr.address, xor_relayed_addr.port}, client}
     else
       _ -> {:ok, client}
@@ -431,7 +549,11 @@ defmodule ExTURN.Client do
        ) do
     with :ok <- Message.authenticate(resp, client.key),
          {:ok, lifetime} <- Message.get_attribute(resp, Lifetime) do
-      notify_after(client, :refresh_alloc, div(lifetime.lifetime * 1000, 2))
+      Process.cancel_timer(client.alloc_exp_timer)
+      flush_mailbox({:ex_turn, _, :allocation_expired})
+      notify_after(client, :refresh_alloc, div(lifetime.value * 1000, 2))
+      exp_timer = notify_after(client, :allocation_expired, lifetime.value * 1000)
+      client = %__MODULE__{client | alloc_exp_timer: exp_timer}
       {:ok, client}
     else
       _ -> {:ok, client}
@@ -440,35 +562,59 @@ defmodule ExTURN.Client do
 
   defp do_handle_stun_message(
          %__MODULE__{} = client,
-         _req,
+         %Message{type: %Type{class: :request, method: :refresh}},
          %Message{type: %Type{class: :error_response, method: :refresh}}
        ) do
-    Logger.warning("Failed to refresh allocation. Closing client.")
-    client = %__MODULE__{client | state: :error}
-    {:error, :failed_to_refresh_alloc, client}
+    Logger.debug("Failed to refresh allocation.")
+    {:ok, client}
   end
 
   defp do_handle_stun_message(
          %__MODULE__{} = client,
-         req,
+         %Message{type: %Type{class: :request, method: :create_permission}} = req,
          %Message{type: %Type{class: :success_response, method: :create_permission}} = resp
        ) do
     case Message.authenticate(resp, client.key) do
       :ok ->
         {:ok, xor_peer_addr} = Message.get_attribute(req, XORPeerAddress)
 
-        notify_after(
-          client,
-          {:refresh_permission, xor_peer_addr.address},
-          div(@permission_lifetime_ms, 2)
-        )
+        new_client = install_or_refresh_permission(client, xor_peer_addr.address)
 
-        permissions = MapSet.put(client.permissions, xor_peer_addr.address)
-        client = %__MODULE__{client | permissions: permissions}
-        {:permission_created, xor_peer_addr.address, client}
+        case Map.get(client.permissions, xor_peer_addr.address) do
+          nil -> {:permission_created, xor_peer_addr.address, new_client}
+          _ -> {:ok, new_client}
+        end
 
       {:error, _reason} ->
         {:ok, client}
+    end
+  end
+
+  defp do_handle_stun_message(
+         %__MODULE__{} = client,
+         %Message{type: %Type{class: :request, method: :create_permission}} = req,
+         %Message{type: %Type{class: :error_response, method: :create_permission}} = resp
+       ) do
+    with :ok <- Message.authenticate(resp, client.key),
+         {:ok, error} <- Message.get_attribute(req, ErrorCode) do
+      {:ok, xor_peer_addr} = Message.get_attribute(req, XORPeerAddress)
+
+      if Map.has_key?(client.permissions, xor_peer_addr.address) do
+        Logger.debug("""
+        Failed to refresh permission for #{inspect(xor_peer_addr.address)}, reason: #{inspect(error)}\
+        """)
+
+        {:ok, client}
+      else
+        Logger.debug("""
+        Failed to create  permission for #{inspect(xor_peer_addr.address)}, reason: #{inspect(error)}\
+        """)
+
+        client = %__MODULE__{client | state: :error}
+        {:error, :failed_to_create_permission, client}
+      end
+    else
+      _ -> {:ok, client}
     end
   end
 
@@ -477,42 +623,92 @@ defmodule ExTURN.Client do
          req,
          %Message{type: %Type{class: :success_response, method: :channel_bind}} = resp
        ) do
-    case Message.authenticate(resp, client.key) do
-      :ok ->
-        {:ok, xor_peer_addr} = Message.get_attribute(req, XORPeerAddress)
-        {:ok, channel_number} = Message.get_attribute(req, ChannelNumber)
+    with :ok <- Message.authenticate(resp, client.key),
+         {:ok, xor_peer_addr} <- Message.get_attribute(req, XORPeerAddress),
+         {:ok, channel_number} <- Message.get_attribute(req, ChannelNumber) do
+      peer_addr = {xor_peer_addr.address, xor_peer_addr.port}
 
-        notify_after(client, {:refresh_channel, xor_peer_addr}, div(@channel_lifetime_ms, 2))
+      cond do
+        Map.has_key?(client.addr_channel, peer_addr) == true and
+            Map.has_key?(client.channel_addr, channel_number.value) == true ->
+          client = install_or_refresh_permission(client, xor_peer_addr.address)
+          # refresh channel binding
+          old_exp_timer = Map.fetch!(client.channel_timer, channel_number.value)
+          Process.cancel_timer(old_exp_timer)
+          flush_mailbox({:channel_expired, ^peer_addr})
+          notify_after(client, {:refresh_channel, peer_addr}, div(@channel_lifetime_ms, 2))
 
-        # creating/refreshing a channel, also creates/refreshes permission
-        permissions = MapSet.put(client.permissions, xor_peer_addr.address)
+          exp_timer = notify_after(client, {:channel_expired, peer_addr}, @channel_lifetime_ms)
 
-        peer_addr = {xor_peer_addr.address, xor_peer_addr.port}
-        addr_channel = Map.put(client.addr_channel, peer_addr, channel_number.value)
-        channel_addr = Map.put(client.channel_addr, channel_number.value, peer_addr)
+          channel_timer = Map.put(client.channel_timer, channel_number.value, exp_timer)
+          {:ok, %__MODULE__{client | channel_timer: channel_timer}}
 
-        client = %__MODULE__{
-          client
-          | permissions: permissions,
-            addr_channel: addr_channel,
-            channel_addr: channel_addr
-        }
+        Map.has_key?(client.addr_channel, xor_peer_addr.address) == false and
+            Map.has_key?(client.channel_addr, channel_number.value) == false ->
+          client = install_or_refresh_permission(client, xor_peer_addr.address)
+          # install channel binding
+          notify_after(client, {:refresh_channel, peer_addr}, div(@channel_lifetime_ms, 2))
 
-        {:channel_created, {xor_peer_addr.address, xor_peer_addr.port}, client}
+          exp_timer =
+            notify_after(client, {:channel_expired, peer_addr}, @channel_lifetime_ms)
 
-      {:error, _reason} ->
+          addr_channel = Map.put(client.addr_channel, peer_addr, channel_number.value)
+          channel_addr = Map.put(client.channel_addr, channel_number.value, peer_addr)
+          channel_timer = Map.put(client.channel_timer, channel_number.value, exp_timer)
+
+          client = %__MODULE__{
+            client
+            | addr_channel: addr_channel,
+              channel_addr: channel_addr,
+              channel_timer: channel_timer
+          }
+
+          {:channel_created, peer_addr, client}
+
+        true ->
+          Logger.debug(
+            "Invalid channel bind success response. Invalid address or channel number. Ignoring"
+          )
+
+          {:ok, client}
+      end
+    else
+      _ ->
+        Logger.debug("Invalid channel bind success response. Ignoring.")
         {:ok, client}
     end
   end
 
   defp do_handle_stun_message(
          %__MODULE__{} = client,
-         req,
-         %Message{type: %Type{class: :error_response, method: :channel_bind}}
+         %Message{type: %Type{class: :request, method: :channel_bind}} = req,
+         %Message{type: %Type{class: :error_response, method: :channel_bind}} = resp
        ) do
-    Logger.warning("Failed to create channel binding for: #{inspect(req)}. Closing client.")
-    client = %__MODULE__{client | state: :error}
-    {:error, :failed_to_create_channel, client}
+    {:ok, xor_peer_addr} = Message.get_attribute(req, XORPeerAddress)
+    {:ok, channel_number} = Message.get_attribute(req, ChannelNumber)
+    peer_addr = {xor_peer_addr.address, xor_peer_addr.port}
+
+    with :ok <- Message.authenticate(resp, client.key),
+         {:ok, error} <- Message.get_attribute(resp, ErrorCode) do
+      if Map.has_key?(client.addr_channel, peer_addr) == true and
+           Map.has_key?(client.channel_addr, channel_number.value) == true do
+        Logger.debug(
+          "Failed to refresh channel binding for: #{inspect(req)}, reason: #{inspect(error)}."
+        )
+
+        {:ok, client}
+      else
+        Logger.debug(
+          "Failed to create channel binding for: #{inspect(req)}, reason: #{inspect(error)}. Closing client."
+        )
+
+        client = %__MODULE__{client | state: :error}
+        {:error, :failed_to_create_channel, client}
+      end
+    else
+      {:error, _reason} ->
+        {:ok, client}
+    end
   end
 
   defp do_handle_stun_message(client, req, resp) do
@@ -523,6 +719,30 @@ defmodule ExTURN.Client do
     """)
 
     {:ok, client}
+  end
+
+  defp install_or_refresh_permission(client, ip) do
+    case Map.get(client.permissions, ip) do
+      nil ->
+        :ok
+
+      %{exp_timer: old_exp_timer, refresh_timer: old_refresh_timer} ->
+        # If there already is a permission, cancel its timer
+        Process.cancel_timer(old_refresh_timer)
+        Process.cancel_timer(old_exp_timer)
+        flush_mailbox({:ex_turn, _, {:refresh_permission, ^ip}})
+        flush_mailbox({:ex_turn, _, {:permission_expired, ^ip}})
+    end
+
+    refresh_timer =
+      notify_after(client, {:refresh_permission, ip}, div(@permission_lifetime_ms, 2))
+
+    exp_timer = notify_after(client, {:permission_expired, ip}, @permission_lifetime_ms)
+
+    permissions =
+      Map.put(client.permissions, ip, %{refresh_timer: refresh_timer, exp_timer: exp_timer})
+
+    %__MODULE__{client | permissions: permissions}
   end
 
   defp execute_transaction(client, req) do
