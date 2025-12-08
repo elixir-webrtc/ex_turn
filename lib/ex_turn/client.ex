@@ -84,11 +84,13 @@ defmodule ExTURN.Client do
     * `:auth` - the first allocation request has been sent
     * `:alloc` - an actuall allocation request with auth attributes has been sent
     * `:allocated` - an allocation has been successfully created
+    * `:deallocating` - a deallocation request (REFRESH with lifetime=0) has been sent
+    * `:deallocated` - the allocation has been successfully deallocated
     * `:error` - an error has occured and the client cannot be used anymore.
   """
   @type t() :: %__MODULE__{
           ref: reference(),
-          state: :new | :auth | :alloc | :allocated | :error,
+          state: :new | :auth | :alloc | :allocated | :deallocating | :deallocated | :error,
           uri: ExSTUN.URI.t(),
           turn_ip: :inet.ip_address(),
           turn_port: :inet.port_number(),
@@ -261,9 +263,37 @@ defmodule ExTURN.Client do
     {:ok, client}
   end
 
+  @doc """
+  Deallocates the TURN allocation by sending a REFRESH request with lifetime=0.
+
+  This should be called when the allocation is no longer needed to cleanly
+  release resources on the TURN server.
+  """
+  @spec deallocate(t()) :: {:send, addr(), binary(), t()} | {:ok, t()}
+  def deallocate(%__MODULE__{state: :allocated} = client) do
+    Process.cancel_timer(client.alloc_exp_timer)
+    flush_mailbox({:ex_turn, _, :allocation_expired})
+    flush_mailbox({:ex_turn, _, :refresh_alloc})
+    req = refresh_request_with_lifetime(0, client.username, client.realm, client.nonce, client.key)
+    client = %__MODULE__{client | state: :deallocating}
+    execute_transaction(client, req)
+  end
+
+  def deallocate(%__MODULE__{state: state} = client) do
+    Logger.debug("Cannot deallocate in state #{state}. Ignoring.")
+    {:ok, client}
+  end
+
   @spec handle_message(t(), message()) :: on_handle_message()
-  def handle_message(%__MODULE__{state: state} = client, msg) when state != :error do
+  def handle_message(%__MODULE__{state: state} = client, msg) when state not in [:error, :deallocated] do
     do_handle_message(client, msg)
+  end
+
+  # Handle messages when client is in error or deallocated state.
+  # These are no-ops since the client is already unusable.
+  def handle_message(%__MODULE__{state: state} = client, msg) when state in [:error, :deallocated] do
+    Logger.debug("Received message #{inspect(msg)} in #{state} state. Ignoring.")
+    {:ok, client}
   end
 
   @spec has_permission?(t(), :inet.ip_address()) :: boolean()
@@ -549,12 +579,20 @@ defmodule ExTURN.Client do
        ) do
     with :ok <- Message.authenticate(resp, client.key),
          {:ok, lifetime} <- Message.get_attribute(resp, Lifetime) do
-      Process.cancel_timer(client.alloc_exp_timer)
-      flush_mailbox({:ex_turn, _, :allocation_expired})
-      notify_after(client, :refresh_alloc, div(lifetime.value * 1000, 2))
-      exp_timer = notify_after(client, :allocation_expired, lifetime.value * 1000)
-      client = %__MODULE__{client | alloc_exp_timer: exp_timer}
-      {:ok, client}
+      if lifetime.value == 0 do
+        # Deallocation successful - allocation has been released
+        Logger.debug("TURN allocation deallocated successfully")
+        client = %__MODULE__{client | state: :deallocated}
+        {:ok, client}
+      else
+        # Normal refresh - reschedule timers
+        Process.cancel_timer(client.alloc_exp_timer)
+        flush_mailbox({:ex_turn, _, :allocation_expired})
+        notify_after(client, :refresh_alloc, div(lifetime.value * 1000, 2))
+        exp_timer = notify_after(client, :allocation_expired, lifetime.value * 1000)
+        client = %__MODULE__{client | alloc_exp_timer: exp_timer}
+        {:ok, client}
+      end
     else
       _ -> {:ok, client}
     end
@@ -781,6 +819,18 @@ defmodule ExTURN.Client do
   defp refresh_request(username, realm, nonce, key) do
     %Type{class: :request, method: :refresh}
     |> Message.new([
+      %Username{value: username},
+      %Nonce{value: nonce},
+      %Realm{value: realm}
+    ])
+    |> Message.with_integrity(key)
+    |> Message.with_fingerprint()
+  end
+
+  defp refresh_request_with_lifetime(lifetime, username, realm, nonce, key) do
+    %Type{class: :request, method: :refresh}
+    |> Message.new([
+      %Lifetime{value: lifetime},
       %Username{value: username},
       %Nonce{value: nonce},
       %Realm{value: realm}
