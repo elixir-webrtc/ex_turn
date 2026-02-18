@@ -304,6 +304,9 @@ defmodule ExTURN.ClientTest do
       msg = {:socket_data, @turn_ip, @turn_port, data}
 
       assert {:ok, %Client{}} = Client.handle_message(client, msg)
+
+      client = %{client | state: :error}
+      assert {:error, :invalid_state, ^client} = Client.handle_message(client, msg)
     end
   end
 
