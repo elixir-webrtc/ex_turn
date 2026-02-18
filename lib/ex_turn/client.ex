@@ -233,7 +233,7 @@ defmodule ExTURN.Client do
     case {permission, channel} do
       {false, nil} ->
         Logger.warning("""
-        Tyring to send data but there is no permission for: #{inspect(ip)}. Ignoring.
+        Trying to send data but there is no permission for: #{inspect(ip)}. Ignoring.
         """)
 
         {:ok, client}
@@ -262,7 +262,12 @@ defmodule ExTURN.Client do
   end
 
   @spec handle_message(t(), message()) :: on_handle_message()
-  def handle_message(%__MODULE__{state: state} = client, msg) when state != :error do
+  def handle_message(%__MODULE__{state: :error} = client, _msg) do
+    Logger.debug("Trying to handle internal/external message in state: error. Ignoring.")
+    {:error, :invalid_state, client}
+  end
+
+  def handle_message(client, msg) do
     do_handle_message(client, msg)
   end
 
