@@ -271,6 +271,48 @@ defmodule ExTURN.Client do
     do_handle_message(client, msg)
   end
 
+  @doc """
+  Gracefully tears down the allocation.
+
+  When the client is `:allocated`, emits a `Refresh` request with `Lifetime=0`
+  (RFC 5766 §7.2) that the caller must ship on the original socket before
+  closing it. This releases the 5-tuple on the TURN server so that a future
+  Allocate from the same source port does not collide and earn a 437
+  "Allocation Mismatch" (RFC 5766 §6.2) — the failure mode observed against
+  Cloudflare TURN, which keeps allocations alive until TTL (default 600s).
+
+  In any other state, there is nothing to release; the client is transitioned
+  to `:error` and no datagram is produced.
+
+  The request is fire-and-forget: the client is already `:error` on return,
+  so a late 437/438 response from the server is ignored.
+  """
+  @spec close(t()) :: {:ok, t()} | {:send, addr(), binary(), t()}
+  def close(%__MODULE__{state: :error} = client), do: {:ok, client}
+
+  def close(%__MODULE__{state: :allocated} = client) do
+    cancel_timers(client)
+
+    req =
+      %Type{class: :request, method: :refresh}
+      |> Message.new([
+        %Lifetime{value: 0},
+        %Username{value: client.username},
+        %Nonce{value: client.nonce},
+        %Realm{value: client.realm}
+      ])
+      |> Message.with_integrity(client.key)
+      |> Message.with_fingerprint()
+
+    client = %__MODULE__{client | state: :error}
+    {:send, {client.turn_ip, client.turn_port}, Message.encode(req), client}
+  end
+
+  def close(%__MODULE__{} = client) do
+    cancel_timers(client)
+    {:ok, %__MODULE__{client | state: :error}}
+  end
+
   @spec has_permission?(t(), :inet.ip_address()) :: boolean()
   def has_permission?(client, ip), do: Map.has_key?(client.permissions, ip)
 
@@ -827,4 +869,24 @@ defmodule ExTURN.Client do
 
   defp notify_after(client, msg, time),
     do: Process.send_after(self(), {:ex_turn, client.ref, msg}, time)
+
+  defp cancel_timers(client) do
+    if client.alloc_exp_timer, do: Process.cancel_timer(client.alloc_exp_timer)
+    flush_mailbox({:ex_turn, _, :refresh_alloc})
+    flush_mailbox({:ex_turn, _, :allocation_expired})
+
+    Enum.each(client.permissions, fn {ip, %{refresh_timer: rt, exp_timer: et}} ->
+      Process.cancel_timer(rt)
+      Process.cancel_timer(et)
+      flush_mailbox({:ex_turn, _, {:refresh_permission, ^ip}})
+      flush_mailbox({:ex_turn, _, {:permission_expired, ^ip}})
+    end)
+
+    Enum.each(client.channel_timer, fn {ch_number, timer} ->
+      Process.cancel_timer(timer)
+      peer_addr = Map.fetch!(client.channel_addr, ch_number)
+      flush_mailbox({:ex_turn, _, {:refresh_channel, ^peer_addr}})
+      flush_mailbox({:ex_turn, _, {:channel_expired, ^peer_addr}})
+    end)
+  end
 end

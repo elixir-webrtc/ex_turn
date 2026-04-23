@@ -88,6 +88,111 @@ defmodule ExTURN.ClientTest do
     assert {:ok, %Nonce{value: @new_nonce}} = Message.get_attribute(new_req, Nonce)
   end
 
+  describe "close" do
+    test "state :new transitions to :error without sending" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+
+      assert {:ok, closed} = Client.close(client)
+      assert closed.state == :error
+    end
+
+    test "state :auth transitions to :error without sending" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      {:send, _dst, _msg, client} = Client.allocate(client)
+      assert client.state == :auth
+
+      assert {:ok, closed} = Client.close(client)
+      assert closed.state == :error
+    end
+
+    test "state :allocated sends Refresh with Lifetime=0 and transitions to :error" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+
+      assert {:send, {@turn_ip, @turn_port}, msg, closed} = Client.close(client)
+      assert closed.state == :error
+
+      {:ok, req} = Message.decode(msg)
+      assert req.type == %Type{class: :request, method: :refresh}
+
+      assert {:ok, %Lifetime{value: 0}} = Message.get_attribute(req, Lifetime)
+      assert {:ok, %Username{value: @username}} = Message.get_attribute(req, Username)
+      assert {:ok, %Realm{value: @realm}} = Message.get_attribute(req, Realm)
+      assert {:ok, %Nonce{value: @nonce}} = Message.get_attribute(req, Nonce)
+
+      # authenticated with long-term credential derived from the allocation
+      key = Message.lt_key(@username, @password, @realm)
+      assert :ok == Message.authenticate(req, key)
+    end
+
+    test "state :allocated cancels the allocation expiration timer" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+      alloc_exp_timer = client.alloc_exp_timer
+      assert Process.read_timer(alloc_exp_timer) != false
+
+      assert {:send, _dst, _msg, _closed} = Client.close(client)
+      assert Process.read_timer(alloc_exp_timer) == false
+    end
+
+    test "state :allocated cancels permission timers" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+      client = create_permission(client, @peer_ip)
+
+      %{refresh_timer: refresh_timer, exp_timer: exp_timer} =
+        Map.fetch!(client.permissions, @peer_ip)
+
+      assert Process.read_timer(refresh_timer) != false
+      assert Process.read_timer(exp_timer) != false
+
+      assert {:send, _dst, _msg, _closed} = Client.close(client)
+
+      assert Process.read_timer(refresh_timer) == false
+      assert Process.read_timer(exp_timer) == false
+    end
+
+    test "state :allocated cancels channel timers" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+      client = create_channel(client, @peer_ip, @peer_port)
+
+      [channel_timer] = Map.values(client.channel_timer)
+      assert Process.read_timer(channel_timer) != false
+
+      assert {:send, _dst, _msg, _closed} = Client.close(client)
+
+      assert Process.read_timer(channel_timer) == false
+    end
+
+    test "state :allocated flushes pending refresh/expiry messages" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+      client = create_permission(client, @peer_ip)
+
+      # Inject the messages that the timers would eventually emit so we can
+      # prove close/1 drains them.
+      send(self(), {:ex_turn, client.ref, :refresh_alloc})
+      send(self(), {:ex_turn, client.ref, :allocation_expired})
+      send(self(), {:ex_turn, client.ref, {:refresh_permission, @peer_ip}})
+      send(self(), {:ex_turn, client.ref, {:permission_expired, @peer_ip}})
+
+      assert {:send, _dst, _msg, _closed} = Client.close(client)
+
+      refute_received {:ex_turn, _, :refresh_alloc}
+      refute_received {:ex_turn, _, :allocation_expired}
+      refute_received {:ex_turn, _, {:refresh_permission, _}}
+      refute_received {:ex_turn, _, {:permission_expired, _}}
+    end
+
+    test "state :error returns {:ok, client} unchanged" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      errored = %{client | state: :error}
+
+      assert {:ok, ^errored} = Client.close(errored)
+    end
+  end
+
   describe "permission" do
     test "create" do
       {:ok, client} = Client.new(@turn_uri, @username, @password)
