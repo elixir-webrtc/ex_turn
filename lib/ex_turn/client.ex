@@ -276,10 +276,9 @@ defmodule ExTURN.Client do
 
   When the client is `:allocated`, emits a `Refresh` request with `Lifetime=0`
   (RFC 5766 §7.2) that the caller must ship on the original socket before
-  closing it. This releases the 5-tuple on the TURN server so that a future
-  Allocate from the same source port does not collide and earn a 437
-  "Allocation Mismatch" (RFC 5766 §6.2) — the failure mode observed against
-  Cloudflare TURN, which keeps allocations alive until TTL (default 600s).
+  closing it. Without this, the server keeps the 5-tuple allocated until its
+  TTL expires, and a future Allocate from the same source port is rejected
+  with 437 Allocation Mismatch (RFC 5766 §6.2).
 
   In any other state, there is nothing to release; the client is transitioned
   to `:error` and no datagram is produced.
@@ -293,16 +292,7 @@ defmodule ExTURN.Client do
   def close(%__MODULE__{state: :allocated} = client) do
     cancel_timers(client)
 
-    req =
-      %Type{class: :request, method: :refresh}
-      |> Message.new([
-        %Lifetime{value: 0},
-        %Username{value: client.username},
-        %Nonce{value: client.nonce},
-        %Realm{value: client.realm}
-      ])
-      |> Message.with_integrity(client.key)
-      |> Message.with_fingerprint()
+    req = refresh_request(client.username, client.realm, client.nonce, client.key, 0)
 
     client = %__MODULE__{client | state: :error}
     {:send, {client.turn_ip, client.turn_port}, Message.encode(req), client}
@@ -825,13 +815,17 @@ defmodule ExTURN.Client do
     |> Message.with_fingerprint()
   end
 
-  defp refresh_request(username, realm, nonce, key) do
-    %Type{class: :request, method: :refresh}
-    |> Message.new([
+  defp refresh_request(username, realm, nonce, key, lifetime \\ nil) do
+    attrs = [
       %Username{value: username},
       %Nonce{value: nonce},
       %Realm{value: realm}
-    ])
+    ]
+
+    attrs = if lifetime != nil, do: [%Lifetime{value: lifetime} | attrs], else: attrs
+
+    %Type{class: :request, method: :refresh}
+    |> Message.new(attrs)
     |> Message.with_integrity(key)
     |> Message.with_fingerprint()
   end
@@ -871,22 +865,23 @@ defmodule ExTURN.Client do
     do: Process.send_after(self(), {:ex_turn, client.ref, msg}, time)
 
   defp cancel_timers(client) do
+    ref = client.ref
     if client.alloc_exp_timer, do: Process.cancel_timer(client.alloc_exp_timer)
-    flush_mailbox({:ex_turn, _, :refresh_alloc})
-    flush_mailbox({:ex_turn, _, :allocation_expired})
+    flush_mailbox({:ex_turn, ^ref, :refresh_alloc})
+    flush_mailbox({:ex_turn, ^ref, :allocation_expired})
 
     Enum.each(client.permissions, fn {ip, %{refresh_timer: rt, exp_timer: et}} ->
       Process.cancel_timer(rt)
       Process.cancel_timer(et)
-      flush_mailbox({:ex_turn, _, {:refresh_permission, ^ip}})
-      flush_mailbox({:ex_turn, _, {:permission_expired, ^ip}})
+      flush_mailbox({:ex_turn, ^ref, {:refresh_permission, ^ip}})
+      flush_mailbox({:ex_turn, ^ref, {:permission_expired, ^ip}})
     end)
 
     Enum.each(client.channel_timer, fn {ch_number, timer} ->
       Process.cancel_timer(timer)
       peer_addr = Map.fetch!(client.channel_addr, ch_number)
-      flush_mailbox({:ex_turn, _, {:refresh_channel, ^peer_addr}})
-      flush_mailbox({:ex_turn, _, {:channel_expired, ^peer_addr}})
+      flush_mailbox({:ex_turn, ^ref, {:refresh_channel, ^peer_addr}})
+      flush_mailbox({:ex_turn, ^ref, {:channel_expired, ^peer_addr}})
     end)
   end
 end

@@ -105,6 +105,20 @@ defmodule ExTURN.ClientTest do
       assert closed.state == :error
     end
 
+    test "state :alloc transitions to :error without sending" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      {:send, _dst, msg, client} = Client.allocate(client)
+      {:ok, req} = Message.decode(msg)
+
+      resp = allocate_error_response(req)
+      resp = {:socket_data, client.turn_ip, client.turn_port, resp}
+      {:send, _dst, _msg, client} = Client.handle_message(client, resp)
+      assert client.state == :alloc
+
+      assert {:ok, closed} = Client.close(client)
+      assert closed.state == :error
+    end
+
     test "state :allocated sends Refresh with Lifetime=0 and transitions to :error" do
       {:ok, client} = Client.new(@turn_uri, @username, @password)
       client = allocate(client)
