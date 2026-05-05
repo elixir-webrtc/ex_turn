@@ -272,19 +272,11 @@ defmodule ExTURN.Client do
   end
 
   @doc """
-  Gracefully tears down the allocation.
+  Gracefully closes the client.
 
-  When the client is `:allocated`, emits a `Refresh` request with `Lifetime=0`
-  (RFC 5766 §7.2) that the caller must ship on the original socket before
-  closing it. Without this, the server keeps the 5-tuple allocated until its
-  TTL expires, and a future Allocate from the same source port is rejected
-  with 437 Allocation Mismatch (RFC 5766 §6.2).
+  If an allocation is present, emits a `Refresh` request with `Lifetime=0` to be sent, per RFC 5766 sec. 7.2.
 
-  In any other state, there is nothing to release; the client is transitioned
-  to `:error` and no datagram is produced.
-
-  The request is fire-and-forget: the client is already `:error` on return,
-  so a late 437/438 response from the server is ignored.
+  After calling `close/1`, the client transitions to state `:error`.
   """
   @spec close(t()) :: {:ok, t()} | {:send, addr(), binary(), t()}
   def close(%__MODULE__{state: :error} = client), do: {:ok, client}
