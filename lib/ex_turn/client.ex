@@ -271,6 +271,30 @@ defmodule ExTURN.Client do
     do_handle_message(client, msg)
   end
 
+  @doc """
+  Gracefully closes the client.
+
+  If an allocation is present, emits a `Refresh` request with `Lifetime=0` to be sent, per RFC 5766 sec. 7.2.
+
+  After calling `close/1`, the client transitions to state `:error`.
+  """
+  @spec close(t()) :: {:ok, t()} | {:send, addr(), binary(), t()}
+  def close(%__MODULE__{state: :error} = client), do: {:ok, client}
+
+  def close(%__MODULE__{state: :allocated} = client) do
+    cancel_timers(client)
+
+    req = refresh_request(client.username, client.realm, client.nonce, client.key, 0)
+
+    client = %__MODULE__{client | state: :error}
+    {:send, {client.turn_ip, client.turn_port}, Message.encode(req), client}
+  end
+
+  def close(%__MODULE__{} = client) do
+    cancel_timers(client)
+    {:ok, %__MODULE__{client | state: :error}}
+  end
+
   @spec has_permission?(t(), :inet.ip_address()) :: boolean()
   def has_permission?(client, ip), do: Map.has_key?(client.permissions, ip)
 
@@ -783,13 +807,17 @@ defmodule ExTURN.Client do
     |> Message.with_fingerprint()
   end
 
-  defp refresh_request(username, realm, nonce, key) do
-    %Type{class: :request, method: :refresh}
-    |> Message.new([
+  defp refresh_request(username, realm, nonce, key, lifetime \\ nil) do
+    attrs = [
       %Username{value: username},
       %Nonce{value: nonce},
       %Realm{value: realm}
-    ])
+    ]
+
+    attrs = if lifetime != nil, do: [%Lifetime{value: lifetime} | attrs], else: attrs
+
+    %Type{class: :request, method: :refresh}
+    |> Message.new(attrs)
     |> Message.with_integrity(key)
     |> Message.with_fingerprint()
   end
@@ -827,4 +855,25 @@ defmodule ExTURN.Client do
 
   defp notify_after(client, msg, time),
     do: Process.send_after(self(), {:ex_turn, client.ref, msg}, time)
+
+  defp cancel_timers(client) do
+    ref = client.ref
+    if client.alloc_exp_timer, do: Process.cancel_timer(client.alloc_exp_timer)
+    flush_mailbox({:ex_turn, ^ref, :refresh_alloc})
+    flush_mailbox({:ex_turn, ^ref, :allocation_expired})
+
+    Enum.each(client.permissions, fn {ip, %{refresh_timer: rt, exp_timer: et}} ->
+      Process.cancel_timer(rt)
+      Process.cancel_timer(et)
+      flush_mailbox({:ex_turn, ^ref, {:refresh_permission, ^ip}})
+      flush_mailbox({:ex_turn, ^ref, {:permission_expired, ^ip}})
+    end)
+
+    Enum.each(client.channel_timer, fn {ch_number, timer} ->
+      Process.cancel_timer(timer)
+      peer_addr = Map.fetch!(client.channel_addr, ch_number)
+      flush_mailbox({:ex_turn, ^ref, {:refresh_channel, ^peer_addr}})
+      flush_mailbox({:ex_turn, ^ref, {:channel_expired, ^peer_addr}})
+    end)
+  end
 end
