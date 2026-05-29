@@ -1,7 +1,7 @@
 defmodule ExTURN.MixProject do
   use Mix.Project
 
-  @version "0.2.2"
+  @version "0.2.3"
   @source_url "https://github.com/elixir-webrtc/ex_turn"
 
   def project do
@@ -25,8 +25,13 @@ defmodule ExTURN.MixProject do
       ],
 
       # code coverage
-      test_coverage: [tool: ExCoveralls],
-      preferred_cli_env: [
+      test_coverage: [tool: ExCoveralls]
+    ]
+  end
+
+  def cli do
+    [
+      preferred_envs: [
         coveralls: :test,
         "coveralls.detail": :test,
         "coveralls.post": :test,

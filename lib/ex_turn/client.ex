@@ -347,24 +347,24 @@ defmodule ExTURN.Client do
     execute_transaction(client, req)
   end
 
-  defp do_handle_message(client, {:transaction_timeout, t_id}) do
+  defp do_handle_message(%__MODULE__{} = client, {:transaction_timeout, t_id}) do
     case pop_in(client.transactions[t_id]) do
       {nil, client} ->
         {:ok, client}
 
       {msg, client} ->
         reason = String.to_atom("#{msg.type.method}_request_timeout")
-        client = %__MODULE__{client | state: :error}
+        client = %{client | state: :error}
         {:error, reason, client}
     end
   end
 
-  defp do_handle_message(client, :allocation_expired) do
-    client = %__MODULE__{client | state: :error}
+  defp do_handle_message(%__MODULE__{} = client, :allocation_expired) do
+    client = %{client | state: :error}
     {:error, :allocation_expired, client}
   end
 
-  defp do_handle_message(client, {:permission_expired, ip}) do
+  defp do_handle_message(%__MODULE__{} = client, {:permission_expired, ip}) do
     permissions = Map.delete(client.permissions, ip)
 
     {to_delete, _} =
@@ -377,7 +377,7 @@ defmodule ExTURN.Client do
     channel_addr = Map.drop(client.channel_addr, ch_to_delete)
     channel_timer = Map.drop(client.channel_timer, ch_to_delete)
 
-    client = %__MODULE__{
+    client = %{
       client
       | permissions: permissions,
         addr_channel: addr_channel,
@@ -388,12 +388,12 @@ defmodule ExTURN.Client do
     {:permission_expired, ip, client}
   end
 
-  defp do_handle_message(client, {:channel_expired, peer_addr}) do
+  defp do_handle_message(%__MODULE__{} = client, {:channel_expired, peer_addr}) do
     {channel_number, addr_channel} = Map.pop!(client.addr_channel, peer_addr)
     {_, channel_addr} = Map.pop!(client.channel_addr, channel_number)
     {_, channel_timer} = Map.pop!(client.channel_timer, channel_number)
 
-    client = %__MODULE__{
+    client = %{
       client
       | addr_channel: addr_channel,
         channel_addr: channel_addr,
@@ -486,14 +486,14 @@ defmodule ExTURN.Client do
     end
   end
 
-  defp handle_stale_nonce(client, req, resp) do
+  defp handle_stale_nonce(%__MODULE__{} = client, %Message{} = req, resp) do
     case Message.get_attribute(resp, Nonce) do
       {:ok, %Nonce{value: nonce}} ->
         # TODO extend ex_stun API so this code isn't so hacky
         tmp_msg = Message.new(%Type{method: :binding, class: :request})
-        client = %__MODULE__{client | nonce: nonce}
+        client = %{client | nonce: nonce}
         attrs = Enum.reject(req.attributes, fn attr -> attr.type == 0x0015 end)
-        req = %Message{req | transaction_id: tmp_msg.transaction_id, attributes: attrs}
+        req = %{req | transaction_id: tmp_msg.transaction_id, attributes: attrs}
         req = Message.add_attribute(req, Nonce.to_raw(%Nonce{value: nonce}, req))
         execute_transaction(client, req)
 
@@ -670,7 +670,7 @@ defmodule ExTURN.Client do
           exp_timer = notify_after(client, {:channel_expired, peer_addr}, @channel_lifetime_ms)
 
           channel_timer = Map.put(client.channel_timer, channel_number.value, exp_timer)
-          {:ok, %__MODULE__{client | channel_timer: channel_timer}}
+          {:ok, %{client | channel_timer: channel_timer}}
 
         Map.has_key?(client.addr_channel, xor_peer_addr.address) == false and
             Map.has_key?(client.channel_addr, channel_number.value) == false ->
@@ -685,7 +685,7 @@ defmodule ExTURN.Client do
           channel_addr = Map.put(client.channel_addr, channel_number.value, peer_addr)
           channel_timer = Map.put(client.channel_timer, channel_number.value, exp_timer)
 
-          client = %__MODULE__{
+          client = %{
             client
             | addr_channel: addr_channel,
               channel_addr: channel_addr,
@@ -750,7 +750,7 @@ defmodule ExTURN.Client do
     {:ok, client}
   end
 
-  defp install_or_refresh_permission(client, ip) do
+  defp install_or_refresh_permission(%__MODULE__{} = client, ip) do
     case Map.get(client.permissions, ip) do
       nil ->
         :ok
@@ -771,7 +771,7 @@ defmodule ExTURN.Client do
     permissions =
       Map.put(client.permissions, ip, %{refresh_timer: refresh_timer, exp_timer: exp_timer})
 
-    %__MODULE__{client | permissions: permissions}
+    %{client | permissions: permissions}
   end
 
   defp execute_transaction(client, req) do
