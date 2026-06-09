@@ -56,7 +56,7 @@ defmodule ExTURN.MixProject do
 
   defp deps do
     [
-      {:ex_stun, "~> 0.2.0"},
+      {:ex_stun, "~> 0.2.1"},
 
       # dev/test
       {:excoveralls, "~> 0.17.0", only: [:dev, :test], runtime: false},
