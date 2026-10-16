@@ -402,6 +402,25 @@ defmodule ExTURN.ClientTest do
                Client.handle_message(client, msg)
     end
 
+    # RFC 8656 section 12.5: a server may pad ChannelData to a multiple of four
+    # bytes, even over UDP, so up to three bytes can follow the data.
+    test "with padded channel data" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+      client = create_permission(client, @peer_ip)
+      client = create_channel(client, @peer_ip, @peer_port)
+
+      [channel_no] = Map.keys(client.channel_addr)
+
+      payload = "padded"
+      data = <<channel_no::16, byte_size(payload)::16, payload::binary, 0, 0>>
+
+      msg = {:socket_data, @turn_ip, @turn_port, data}
+
+      assert {:data, {@peer_ip, @peer_port}, ^payload, %Client{}} =
+               Client.handle_message(client, msg)
+    end
+
     test "without permission" do
       {:ok, client} = Client.new(@turn_uri, @username, @password)
       client = allocate(client)

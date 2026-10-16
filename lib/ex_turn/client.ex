@@ -403,7 +403,13 @@ defmodule ExTURN.Client do
     {:channel_expired, peer_addr, client}
   end
 
-  defp handle_channel_data(client, <<channel_number::16, len::16, data::binary-size(len)>>) do
+  # A server may pad ChannelData to a multiple of four bytes even over UDP
+  # (RFC 8656, section 12.5), so up to three trailing bytes follow `len`.
+  defp handle_channel_data(
+         client,
+         <<channel_number::16, len::16, data::binary-size(len), padding::binary>>
+       )
+       when byte_size(padding) <= 3 do
     case Map.get(client.channel_addr, channel_number) do
       nil ->
         Logger.debug("""
