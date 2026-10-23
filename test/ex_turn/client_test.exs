@@ -276,6 +276,31 @@ defmodule ExTURN.ClientTest do
       create_channel(client, @peer_ip, @peer_port)
     end
 
+    test "binds in flight at the same time get distinct channel numbers" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+
+      # No response yet: neither channel is bound when the second is requested.
+      {:send, _dst, first, client} = Client.create_channel(client, @peer_ip, @peer_port)
+      {:send, _dst, second, client} = Client.create_channel(client, @peer_ip, @peer_port + 1)
+
+      assert channel_number(first) != channel_number(second)
+
+      # A third bind once the first has completed reuses neither.
+      {:ok, first_req} = Message.decode(first)
+      resp = create_channel_bind_success_response(first_req)
+
+      assert {:channel_created, _addr, client} =
+               Client.handle_message(
+                 client,
+                 {:socket_data, client.turn_ip, client.turn_port, resp}
+               )
+
+      {:send, _dst, third, _client} = Client.create_channel(client, @peer_ip, @peer_port + 2)
+
+      assert channel_number(third) not in [channel_number(first), channel_number(second)]
+    end
+
     test "refresh success response" do
       {:ok, client} = Client.new(@turn_uri, @username, @password)
       client = allocate(client)
@@ -455,6 +480,15 @@ defmodule ExTURN.ClientTest do
     assert {:permission_created, _ip, client} = Client.handle_message(client, resp)
 
     client
+  end
+
+  defp channel_number(data) do
+    {:ok, msg} = Message.decode(data)
+
+    {:ok, %ExTURN.Attribute.ChannelNumber{value: number}} =
+      Message.get_attribute(msg, ExTURN.Attribute.ChannelNumber)
+
+    number
   end
 
   defp create_channel(client, ip, port) do

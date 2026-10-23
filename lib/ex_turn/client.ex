@@ -208,7 +208,7 @@ defmodule ExTURN.Client do
 
       {:ok, client}
     else
-      channel_number = find_free_channel_number(Map.values(client.addr_channel))
+      channel_number = find_free_channel_number(used_channel_numbers(client))
 
       req =
         channel_bind_request(
@@ -846,6 +846,19 @@ defmodule ExTURN.Client do
     ])
     |> Message.with_integrity(key)
     |> Message.with_fingerprint()
+  end
+
+  # Bound channels and those of ChannelBind requests still in flight: two binds
+  # sent before either is answered must not share a number, or the server
+  # rejects the second and the client goes to :error.
+  defp used_channel_numbers(client) do
+    in_flight =
+      for {_id, %Message{type: %Type{class: :request, method: :channel_bind}} = msg} <-
+            client.transactions,
+          {:ok, %ChannelNumber{value: number}} = Message.get_attribute(msg, ChannelNumber),
+          do: number
+
+    Map.values(client.addr_channel) ++ in_flight
   end
 
   defp find_free_channel_number(channels) do
