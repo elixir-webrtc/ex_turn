@@ -324,6 +324,112 @@ defmodule ExTURN.ClientTest do
     end
   end
 
+  describe "transaction retransmission" do
+    # Sent at 0, 20 and 60 ms; times out at 140 ms.
+    @rtx_opts [rto: 20, rc: 3, rm: 4]
+
+    test "defaults follow RFC 5389: RTO 500 ms, Rc 7, Rm 16" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      assert %Client{rto: 500, rc: 7, rm: 16} = client
+
+      {:send, dst, data, client} = Client.allocate(client)
+
+      ref = client.ref
+      refute_receive {:ex_turn, ^ref, _msg}, 450
+      assert {:send, ^dst, ^data, _client} = Client.handle_message(client, next_timer_msg(client))
+    end
+
+    test "a lost response is recovered by retransmitting the request" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password, @rtx_opts)
+      client = allocate(client)
+
+      {:send, dst, data, client} = Client.handle_message(client, :refresh_alloc)
+
+      # The response is lost: the same request, with the same transaction id, goes out again.
+      assert {:send, ^dst, ^data, client} = Client.handle_message(client, next_timer_msg(client))
+
+      {:ok, req} = Message.decode(data)
+      resp = {:socket_data, client.turn_ip, client.turn_port, refresh_success_response(req)}
+      assert {:ok, client} = Client.handle_message(client, resp)
+      assert client.state == :allocated
+
+      assert_no_further_transaction_activity(client)
+    end
+
+    test "a response to a later retransmission completes the transaction" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password, @rtx_opts)
+      client = allocate(client)
+
+      {:send, dst, data, client} = Client.create_permission(client, @peer_ip)
+
+      # The responses to the first two copies are lost.
+      assert {:send, ^dst, ^data, client} = Client.handle_message(client, next_timer_msg(client))
+      assert {:send, ^dst, ^data, client} = Client.handle_message(client, next_timer_msg(client))
+
+      {:ok, req} = Message.decode(data)
+
+      resp =
+        {:socket_data, client.turn_ip, client.turn_port, create_permission_success_response(req)}
+
+      assert {:permission_created, @peer_ip, client} = Client.handle_message(client, resp)
+
+      assert_no_further_transaction_activity(client)
+    end
+
+    test "times out only after the last retransmission's wait" do
+      # Sent at 0, 50 and 150 ms; times out at 150 + 8 * 50 = 550 ms.
+      {:ok, client} = Client.new(@turn_uri, @username, @password, rto: 50, rc: 3, rm: 8)
+      client = allocate(client)
+      start = System.monotonic_time(:millisecond)
+
+      {:send, dst, data, client} = Client.create_channel(client, @peer_ip, @peer_port)
+
+      assert {:send, ^dst, ^data, client} = Client.handle_message(client, next_timer_msg(client))
+      assert elapsed_since(start) >= 50
+
+      assert {:send, ^dst, ^data, client} = Client.handle_message(client, next_timer_msg(client))
+      assert elapsed_since(start) >= 150
+
+      assert {:error, :channel_bind_request_timeout, client} =
+               Client.handle_message(client, next_timer_msg(client))
+
+      elapsed = elapsed_since(start)
+      assert elapsed >= 550
+      assert elapsed < 1_000
+      assert client.state == :error
+    end
+
+    test "a response arriving after the transaction completed is ignored" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password, @rtx_opts)
+      client = allocate(client)
+
+      {:send, dst, data, client} = Client.create_permission(client, @peer_ip)
+      # The first response is only delayed, so the request goes out twice.
+      assert {:send, ^dst, ^data, client} = Client.handle_message(client, next_timer_msg(client))
+
+      {:ok, req} = Message.decode(data)
+
+      resp =
+        {:socket_data, client.turn_ip, client.turn_port, create_permission_success_response(req)}
+
+      assert {:permission_created, @peer_ip, client} = Client.handle_message(client, resp)
+      # The server's response to the retransmission.
+      assert {:ok, ^client} = Client.handle_message(client, resp)
+
+      assert_no_further_transaction_activity(client)
+    end
+
+    test "close/1 stops retransmitting requests in flight" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password, @rtx_opts)
+      {:send, _dst, _data, client} = Client.allocate(client)
+
+      assert {:ok, _closed} = Client.close(client)
+
+      ref = client.ref
+      refute_receive {:ex_turn, ^ref, _msg}, 200
+    end
+  end
+
   describe "send/3" do
     test "with permission" do
       {:ok, client} = Client.new(@turn_uri, @username, @password)
@@ -456,6 +562,28 @@ defmodule ExTURN.ClientTest do
 
     client
   end
+
+  defp next_timer_msg(client) do
+    ref = client.ref
+    assert_receive {:ex_turn, ^ref, msg}, 1_000
+    msg
+  end
+
+  # Waits out more than a whole retransmission schedule of @rtx_opts and checks
+  # that no timer that fires in the meantime sends anything or fails the client.
+  defp assert_no_further_transaction_activity(client) do
+    ref = client.ref
+
+    receive do
+      {:ex_turn, ^ref, msg} ->
+        assert {:ok, client} = Client.handle_message(client, msg)
+        assert_no_further_transaction_activity(client)
+    after
+      200 -> :ok
+    end
+  end
+
+  defp elapsed_since(start), do: System.monotonic_time(:millisecond) - start
 
   defp create_channel(client, ip, port) do
     assert {:send, _dst, msg, client} = Client.create_channel(client, ip, port)

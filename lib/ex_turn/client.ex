@@ -98,6 +98,16 @@ defmodule ExTURN.Client do
           nonce: binary(),
           key: binary(),
           transactions: %{(transaction_id :: integer()) => ExSTUN.Message.t()},
+          retransmissions: %{
+            (transaction_id :: integer()) => %{
+              raw: binary(),
+              sent: pos_integer(),
+              timer: reference()
+            }
+          },
+          rto: pos_integer(),
+          rc: pos_integer(),
+          rm: pos_integer(),
           permissions: %{
             :inet.ip_address() => %{:refresh_timer => reference(), :exp_timer => reference()}
           },
@@ -106,6 +116,11 @@ defmodule ExTURN.Client do
           channel_timer: %{pos_integer() => reference()},
           alloc_exp_timer: reference()
         }
+
+  # Retransmission of requests over UDP. See RFC 5389 sec. 7.2.1.
+  @default_rto 500
+  @default_rc 7
+  @default_rm 16
 
   @enforce_keys [:ref, :uri, :turn_ip, :turn_port, :username, :password]
   defstruct @enforce_keys ++
@@ -116,10 +131,14 @@ defmodule ExTURN.Client do
                 :alloc_exp_timer,
                 state: :new,
                 transactions: %{},
+                retransmissions: %{},
                 permissions: %{},
                 addr_channel: %{},
                 channel_addr: %{},
-                channel_timer: %{}
+                channel_timer: %{},
+                rto: @default_rto,
+                rc: @default_rc,
+                rm: @default_rm
               ]
 
   # Permission lifetime must be 300 seconds. See RFC 5766 sec. 8.
@@ -127,8 +146,6 @@ defmodule ExTURN.Client do
 
   # Channel lifetime lasts for 10 minutes. See RFC 5766 sec. 11.
   @channel_lifetime_ms 10 * 60 * 1000
-
-  @transaction_timeout 1000
 
   # This macro is used to flush mailbox after an allocation, permission or channel has been refreshed.
   # In fact, this should never happen as we send refresh requests a few minutes before
@@ -143,9 +160,34 @@ defmodule ExTURN.Client do
     end
   end
 
-  @spec new(ExSTUN.URI.t(), binary(), binary()) ::
+  @typedoc """
+  Options that can be passed to `new/4`.
+
+  Requests are sent over UDP and retransmitted as described in RFC 5389 sec. 7.2.1:
+
+  * `:rto` - initial retransmission timeout in milliseconds. The interval between
+  retransmissions starts at `rto` and doubles after each one. Defaults to `#{@default_rto}`.
+  * `:rc` - the maximum number of times a request is sent, including the first one.
+  Defaults to `#{@default_rc}`.
+  * `:rm` - after the last request has been sent, the client waits `rm * rto` milliseconds
+  for a response before it considers the transaction to have timed out and moves to
+  the `:error` state. Defaults to `#{@default_rm}`.
+
+  With the defaults, a request is sent at 0, 500, 1500, 3500, 7500, 15500 and 31500 ms,
+  and its transaction times out at 39500 ms.
+  """
+  @type option() :: {:rto, pos_integer()} | {:rc, pos_integer()} | {:rm, pos_integer()}
+
+  @doc """
+  Creates a new client.
+
+  See `t:option/0` for the supported options.
+  """
+  @spec new(ExSTUN.URI.t(), binary(), binary(), [option()]) ::
           {:ok, t()} | {:error, :unsupported_turn_uri | :invalid_turn_server}
-  def new(uri, username, password) do
+  def new(uri, username, password, opts \\ []) do
+    opts = Keyword.validate!(opts, rto: @default_rto, rc: @default_rc, rm: @default_rm)
+
     with true <- supported?(uri),
          {:ok, ip} <- resolve(uri) do
       {:ok,
@@ -155,7 +197,10 @@ defmodule ExTURN.Client do
          turn_ip: ip,
          turn_port: uri.port,
          username: username,
-         password: password
+         password: password,
+         rto: opts[:rto],
+         rc: opts[:rc],
+         rm: opts[:rm]
        }}
     else
       false ->
@@ -347,12 +392,18 @@ defmodule ExTURN.Client do
     execute_transaction(client, req)
   end
 
-  defp do_handle_message(%__MODULE__{} = client, {:transaction_timeout, t_id}) do
-    case pop_in(client.transactions[t_id]) do
-      {nil, client} ->
+  defp do_handle_message(%__MODULE__{rc: rc} = client, {:transaction_timeout, t_id}) do
+    case Map.fetch(client.retransmissions, t_id) do
+      :error ->
+        # A response has already completed the transaction.
         {:ok, client}
 
-      {msg, client} ->
+      {:ok, %{raw: raw, sent: sent}} when sent < rc ->
+        client = schedule_retransmission(client, t_id, raw, sent + 1)
+        {:send, {client.turn_ip, client.turn_port}, raw, client}
+
+      {:ok, _rtx} ->
+        {msg, client} = pop_transaction(client, t_id)
         reason = String.to_atom("#{msg.type.method}_request_timeout")
         client = %{client | state: :error}
         {:error, reason, client}
@@ -426,7 +477,7 @@ defmodule ExTURN.Client do
   defp handle_stun_message(client, packet) do
     case Message.decode(packet) do
       {:ok, resp} when is_map_key(client.transactions, resp.transaction_id) ->
-        {req, client} = pop_in(client.transactions[resp.transaction_id])
+        {req, client} = pop_transaction(client, resp.transaction_id)
 
         cond do
           resp.type.class == :error_response and
@@ -775,9 +826,35 @@ defmodule ExTURN.Client do
   end
 
   defp execute_transaction(client, req) do
+    raw = Message.encode(req)
     client = put_in(client.transactions[req.transaction_id], req)
-    notify_after(client, {:transaction_timeout, req.transaction_id}, @transaction_timeout)
-    {:send, {client.turn_ip, client.turn_port}, Message.encode(req), client}
+    client = schedule_retransmission(client, req.transaction_id, raw, 1)
+    {:send, {client.turn_ip, client.turn_port}, raw, client}
+  end
+
+  # Arms the timer for a request that has been sent `sent` times. Until `rc` requests
+  # have been sent, it fires after an interval that starts at `rto` and doubles with
+  # each retransmission. After the last request, it waits `rm * rto` and then times
+  # the transaction out. See RFC 5389 sec. 7.2.1.
+  defp schedule_retransmission(client, t_id, raw, sent) do
+    timeout =
+      if sent < client.rc, do: client.rto * 2 ** (sent - 1), else: client.rm * client.rto
+
+    timer = notify_after(client, {:transaction_timeout, t_id}, timeout)
+    put_in(client.retransmissions[t_id], %{raw: raw, sent: sent, timer: timer})
+  end
+
+  defp pop_transaction(client, t_id) do
+    {req, client} = pop_in(client.transactions[t_id])
+    {rtx, client} = pop_in(client.retransmissions[t_id])
+
+    # The timer may have fired already, with its message still in the mailbox.
+    if rtx != nil and Process.cancel_timer(rtx.timer) == false do
+      ref = client.ref
+      flush_mailbox({:ex_turn, ^ref, {:transaction_timeout, ^t_id}})
+    end
+
+    {req, client}
   end
 
   defp supported?(%ExSTUN.URI{scheme: :turn, transport: :udp}), do: true
@@ -874,6 +951,11 @@ defmodule ExTURN.Client do
       peer_addr = Map.fetch!(client.channel_addr, ch_number)
       flush_mailbox({:ex_turn, ^ref, {:refresh_channel, ^peer_addr}})
       flush_mailbox({:ex_turn, ^ref, {:channel_expired, ^peer_addr}})
+    end)
+
+    Enum.each(client.retransmissions, fn {t_id, %{timer: timer}} ->
+      Process.cancel_timer(timer)
+      flush_mailbox({:ex_turn, ^ref, {:transaction_timeout, ^t_id}})
     end)
   end
 end
