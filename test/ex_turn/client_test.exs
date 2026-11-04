@@ -1,6 +1,8 @@
 defmodule ExTURN.ClientTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias ExSTUN.Message
   alias ExSTUN.Message.Type
   alias ExSTUN.Message.Attribute.{ErrorCode, Nonce, Realm, Username, XORMappedAddress}
@@ -25,6 +27,8 @@ defmodule ExTURN.ClientTest do
 
   @peer_ip {127, 0, 0, 2}
   @peer_port 12_345
+
+  @other_peer_ip {127, 0, 0, 3}
 
   test "new/3" do
     assert {:ok, %Client{}} = Client.new(@turn_uri, @username, @password)
@@ -260,6 +264,44 @@ defmodule ExTURN.ClientTest do
       assert new_refresh_timer == refresh_timer
       assert Process.read_timer(new_exp_timer) != false
     end
+
+    # A server's peer policy may refuse some of the peers ICE asks permissions
+    # for: that peer is unreachable, the allocation is not.
+    test "create error response refuses that peer only" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+
+      {result, log} = with_log(fn -> refuse_permission(client, @peer_ip) end)
+
+      assert {:ok, client} = result
+      assert client.state == :allocated
+      refute Client.has_permission?(client, @peer_ip)
+      assert log =~ "refused a permission for peer #{:inet.ntoa(@peer_ip)}: 403 Forbidden IP"
+
+      client = create_permission(client, @other_peer_ip)
+      assert {:send, _dst, _data, _client} = Client.send(client, {@other_peer_ip, 1}, @data)
+    end
+
+    test "a peer refused again is reported once" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+      {:ok, client} = refuse_permission(client, @peer_ip)
+
+      {result, log} =
+        with_log([level: :warning], fn -> refuse_permission(client, @peer_ip) end)
+
+      assert {:ok, %Client{state: :allocated}} = result
+      assert log == ""
+    end
+
+    test "a permission granted after a refusal is installed" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+      {:ok, client} = refuse_permission(client, @peer_ip)
+
+      client = create_permission(client, @peer_ip)
+      assert Client.has_permission?(client, @peer_ip)
+    end
   end
 
   describe "channel" do
@@ -321,6 +363,33 @@ defmodule ExTURN.ClientTest do
       assert exp_timer == new_exp_timer
       assert Process.read_timer(exp_timer) != false
       assert client.state != :error
+    end
+
+    # A channel only saves bytes: a refused bind leaves the peer on Send
+    # indications, and every other peer as it was.
+    test "create error response keeps that peer on Send indications" do
+      {:ok, client} = Client.new(@turn_uri, @username, @password)
+      client = allocate(client)
+      client = create_permission(client, @peer_ip)
+
+      {:send, _dst, data, client} = Client.create_channel(client, @peer_ip, @peer_port)
+      {:ok, req} = Message.decode(data)
+      resp = {:socket_data, client.turn_ip, client.turn_port, forbidden_error_response(req)}
+
+      {result, log} = with_log(fn -> Client.handle_message(client, resp) end)
+
+      assert {:ok, client} = result
+      assert client.state == :allocated
+      refute Client.has_channel?(client, @peer_ip, @peer_port)
+      assert log =~ "refused a channel for peer #{:inet.ntoa(@peer_ip)}:#{@peer_port}: 403"
+
+      # Not asked again on every packet.
+      assert {:ok, ^client} = Client.create_channel(client, @peer_ip, @peer_port)
+
+      assert {:send, _dst, msg, _client} = Client.send(client, {@peer_ip, @peer_port}, @data)
+      assert {:ok, %Message{type: %Type{class: :indication, method: :send}}} = Message.decode(msg)
+
+      create_channel(client, @peer_ip, @peer_port + 1)
     end
   end
 
@@ -457,6 +526,14 @@ defmodule ExTURN.ClientTest do
     client
   end
 
+  defp refuse_permission(client, ip) do
+    assert {:send, _dst, msg, client} = Client.create_permission(client, ip)
+    assert {:ok, req} = Message.decode(msg)
+
+    resp = {:socket_data, client.turn_ip, client.turn_port, forbidden_error_response(req)}
+    Client.handle_message(client, resp)
+  end
+
   defp create_channel(client, ip, port) do
     assert {:send, _dst, msg, client} = Client.create_channel(client, ip, port)
     assert {:ok, req} = Message.decode(msg)
@@ -538,6 +615,19 @@ defmodule ExTURN.ClientTest do
       req.transaction_id,
       %Type{class: :error_response, method: req.type.method},
       [%ErrorCode{code: 508}]
+    )
+    |> Message.with_integrity(key)
+    |> Message.encode()
+  end
+
+  # What a peer policy answers, e.g. coturn's denied-peer-ip.
+  defp forbidden_error_response(req) do
+    key = auth_request(req)
+
+    Message.new(
+      req.transaction_id,
+      %Type{class: :error_response, method: req.type.method},
+      [%ErrorCode{code: 403, reason: "Forbidden IP"}]
     )
     |> Message.with_integrity(key)
     |> Message.encode()
