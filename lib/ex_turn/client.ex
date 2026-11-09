@@ -101,6 +101,8 @@ defmodule ExTURN.Client do
           permissions: %{
             :inet.ip_address() => %{:refresh_timer => reference(), :exp_timer => reference()}
           },
+          refused_permissions: %{:inet.ip_address() => ErrorCode.t() | nil},
+          refused_channels: %{addr() => ErrorCode.t() | nil},
           addr_channel: %{addr() => pos_integer()},
           channel_addr: %{pos_integer() => addr()},
           channel_timer: %{pos_integer() => reference()},
@@ -117,6 +119,8 @@ defmodule ExTURN.Client do
                 state: :new,
                 transactions: %{},
                 permissions: %{},
+                refused_permissions: %{},
+                refused_channels: %{},
                 addr_channel: %{},
                 channel_addr: %{},
                 channel_timer: %{}
@@ -187,6 +191,12 @@ defmodule ExTURN.Client do
 
   @spec create_channel(t(), :inet.ip_address(), :inet.port_number()) ::
           {:ok, t()} | {:send, addr(), binary(), t()}
+  # The server refused this peer a channel: its data keeps going in Send
+  # indications rather than asking again for every packet.
+  def create_channel(%__MODULE__{state: :allocated} = client, ip, port)
+      when is_map_key(client.refused_channels, {ip, port}),
+      do: {:ok, client}
+
   def create_channel(%__MODULE__{state: :allocated} = client, ip, port) do
     # TODO: Wait 5 minutes before re-using channel number or transport address.
     # See RFC 5766 sec. 11.
@@ -624,26 +634,11 @@ defmodule ExTURN.Client do
          %Message{type: %Type{class: :request, method: :create_permission}} = req,
          %Message{type: %Type{class: :error_response, method: :create_permission}} = resp
        ) do
-    with :ok <- Message.authenticate(resp, client.key),
-         {:ok, error} <- Message.get_attribute(req, ErrorCode) do
-      {:ok, xor_peer_addr} = Message.get_attribute(req, XORPeerAddress)
+    {:ok, xor_peer_addr} = Message.get_attribute(req, XORPeerAddress)
 
-      if Map.has_key?(client.permissions, xor_peer_addr.address) do
-        Logger.debug("""
-        Failed to refresh permission for #{inspect(xor_peer_addr.address)}, reason: #{inspect(error)}\
-        """)
-
-        {:ok, client}
-      else
-        Logger.debug("""
-        Failed to create  permission for #{inspect(xor_peer_addr.address)}, reason: #{inspect(error)}\
-        """)
-
-        client = %__MODULE__{client | state: :error}
-        {:error, :failed_to_create_permission, client}
-      end
-    else
-      _ -> {:ok, client}
+    case Message.authenticate(resp, client.key) do
+      :ok -> handle_permission_error(client, xor_peer_addr.address, error_code(resp))
+      {:error, _reason} -> {:ok, client}
     end
   end
 
@@ -717,26 +712,9 @@ defmodule ExTURN.Client do
     {:ok, channel_number} = Message.get_attribute(req, ChannelNumber)
     peer_addr = {xor_peer_addr.address, xor_peer_addr.port}
 
-    with :ok <- Message.authenticate(resp, client.key),
-         {:ok, error} <- Message.get_attribute(resp, ErrorCode) do
-      if Map.has_key?(client.addr_channel, peer_addr) == true and
-           Map.has_key?(client.channel_addr, channel_number.value) == true do
-        Logger.debug(
-          "Failed to refresh channel binding for: #{inspect(req)}, reason: #{inspect(error)}."
-        )
-
-        {:ok, client}
-      else
-        Logger.debug(
-          "Failed to create channel binding for: #{inspect(req)}, reason: #{inspect(error)}. Closing client."
-        )
-
-        client = %__MODULE__{client | state: :error}
-        {:error, :failed_to_create_channel, client}
-      end
-    else
-      {:error, _reason} ->
-        {:ok, client}
+    case Message.authenticate(resp, client.key) do
+      :ok -> handle_channel_error(client, peer_addr, channel_number.value, error_code(resp))
+      {:error, _reason} -> {:ok, client}
     end
   end
 
@@ -749,6 +727,63 @@ defmodule ExTURN.Client do
 
     {:ok, client}
   end
+
+  defp handle_permission_error(client, ip, error) when is_map_key(client.permissions, ip) do
+    Logger.debug("Failed to refresh permission for #{inspect(ip)}, reason: #{inspect(error)}")
+    {:ok, client}
+  end
+
+  # A refusal concerns that peer only (e.g. a server's peer policy): the
+  # allocation, and every other peer's permission, stay usable. ICE asks for
+  # a permission per remote candidate, so a peer refused once is asked again
+  # with each check; it is reported the first time.
+  defp handle_permission_error(client, ip, _error)
+       when is_map_key(client.refused_permissions, ip),
+       do: {:ok, client}
+
+  defp handle_permission_error(client, ip, error) do
+    Logger.warning("""
+    TURN server #{server(client)} refused a permission for peer #{:inet.ntoa(ip)}: \
+    #{describe_error(error)}. The peer is unreachable through this allocation.\
+    """)
+
+    {:ok, put_in(client.refused_permissions[ip], error)}
+  end
+
+  defp handle_channel_error(client, peer_addr, number, error)
+       when is_map_key(client.addr_channel, peer_addr) and
+              is_map_key(client.channel_addr, number) do
+    Logger.debug(
+      "Failed to refresh channel binding for #{inspect(peer_addr)}, reason: #{inspect(error)}"
+    )
+
+    {:ok, client}
+  end
+
+  # A channel only saves bytes: a refused bind leaves that peer on Send
+  # indications, and the allocation and every other peer as they were.
+  defp handle_channel_error(client, {ip, port} = peer_addr, _number, error) do
+    Logger.warning("""
+    TURN server #{server(client)} refused a channel for peer #{:inet.ntoa(ip)}:#{port}: \
+    #{describe_error(error)}. Sending to it in Send indications.\
+    """)
+
+    {:ok, put_in(client.refused_channels[peer_addr], error)}
+  end
+
+  # nil when the response has no ERROR-CODE that can be read.
+  defp error_code(resp) do
+    case Message.get_attribute(resp, ErrorCode) do
+      {:ok, %ErrorCode{} = error} -> error
+      _missing_or_invalid -> nil
+    end
+  end
+
+  defp describe_error(%ErrorCode{code: code, reason: ""}), do: "#{code}"
+  defp describe_error(%ErrorCode{code: code, reason: reason}), do: "#{code} #{reason}"
+  defp describe_error(nil), do: "no readable ERROR-CODE"
+
+  defp server(client), do: "#{:inet.ntoa(client.turn_ip)}:#{client.turn_port}"
 
   defp install_or_refresh_permission(%__MODULE__{} = client, ip) do
     case Map.get(client.permissions, ip) do
